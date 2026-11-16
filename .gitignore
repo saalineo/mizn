@@ -1,5 +1,7 @@
 /target
+/bpf/target
 /mizn-ebpf/target
+*/target
 miznd_flow_history.csv
 # Telemetry SQLite logs (contains IPs, SNIs, metrics)
 miznd_telemetry.db
@@ -46,3 +48,4 @@ mizn-ebpf/src/vmlinux.h
 secrets/
 config/*.secret.toml
 credentials*
+bpf/target
