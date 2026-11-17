@@ -3,11 +3,11 @@ use crate::features::process_map::SocketsMap;
 use aya::maps::{HashMap as BpfHashMap, PerCpuHashMap as BpfPerCpuHashMap};
 use mizn_common::bpf::{FlowKey, FlowMetrics};
 use mizn_common::ipc::{IpcProcessMetrics, IpcState};
-use rkyv::Infallible;
-use rkyv::ser::Serializer;
 use rkyv::ser::serializers::{BufferScratch, BufferSerializer, CompositeSerializer};
+use rkyv::ser::Serializer;
+use rkyv::Infallible;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
@@ -29,7 +29,10 @@ pub struct CoreLoopArgs {
 pub async fn run(mut args: CoreLoopArgs) {
     // RX and TX maps can hold the same tuple independently, so direction is
     // part of the userspace shadow key as well.
-    let mut bpf_shadow: HashMap<(bool, FlowKey), FlowMetrics> = HashMap::with_capacity(20480);
+    // Keep snapshots only for keys currently present in the bounded LRU maps.
+    // This must remain bounded too: the kernel can evict a flow before it is
+    // seen again, so no later update can naturally replace its old snapshot.
+    let mut bpf_shadow: HashMap<(bool, FlowKey), FlowMetrics> = HashMap::with_capacity(20_480);
     let mut global_state = IpcState::default();
     let mut serial_buf = [0u8; TELEMETRY_BUFFER_SIZE];
     let mut scratch_buf = [0u8; 4096];
@@ -68,8 +71,10 @@ pub async fn run(mut args: CoreLoopArgs) {
                 args.bpf.map_mut(map_name).unwrap(),
             ) {
                 let mut updates = Vec::new();
+                let mut seen = HashSet::new();
                 for r in flow_map.iter().filter_map(|r| r.ok()) {
                     let (key, per_cpu_metrics) = r;
+                    seen.insert(key);
                     let mut metrics = FlowMetrics::default();
                     for m in per_cpu_metrics.iter() {
                         metrics.bytes += m.bytes;
@@ -81,12 +86,26 @@ pub async fn run(mut args: CoreLoopArgs) {
                     }
 
                     let prev = bpf_shadow.entry((is_tx, key)).or_default();
-                    let delta_bytes = metrics.bytes.wrapping_sub(prev.bytes);
+                    // An LRU eviction followed by a new packet for the same
+                    // tuple resets its counters. Treat that snapshot as a new
+                    // flow instead of turning the reset into a wrapped u64
+                    // delta.
+                    let delta_bytes = metrics
+                        .bytes
+                        .checked_sub(prev.bytes)
+                        .unwrap_or(metrics.bytes);
+                    *prev = metrics;
                     if delta_bytes > 0 {
                         updates.push((key, metrics, delta_bytes));
-                        *prev = metrics;
                     }
                 }
+
+                // LRU eviction removes keys from the BPF map without notifying
+                // userspace. Drop their corresponding snapshots after every
+                // successful walk so the userspace table has the same bound as
+                // the kernel flow table.
+                bpf_shadow
+                    .retain(|(shadow_is_tx, key), _| *shadow_is_tx != is_tx || seen.contains(key));
 
                 if !updates.is_empty() {
                     let port_pid_result = BpfHashMap::<_, u32, u32>::try_from(
