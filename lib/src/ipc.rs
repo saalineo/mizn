@@ -97,15 +97,33 @@ impl IpcProcessMetrics {
         }
         self.tcp_flags |= raw.tcp_flags;
     }
+
+    /// Publish the bytes collected during this one-second aggregation tick as
+    /// rates and retain the largest combined rate observed for this process.
+    #[inline(always)]
+    pub fn finalize_tick(&mut self) {
+        self.transmission_rate_bytes_per_second = self.temporal_transmission_accumulator;
+        self.reception_rate_bytes_per_second = self.temporal_reception_accumulator;
+
+        let throughput = self
+            .transmission_rate_bytes_per_second
+            .saturating_add(self.reception_rate_bytes_per_second);
+        self.peak_throughput_bytes_per_second =
+            self.peak_throughput_bytes_per_second.max(throughput);
+    }
 }
 
 impl IpcState {
     #[inline(always)]
     pub fn finalize_tick(&mut self, tx_rate: u64, rx_rate: u64) {
+        for process in self.active_process_telemetry.values_mut() {
+            process.finalize_tick();
+        }
+
         self.aggregate_transmission_rate_bytes_per_second = tx_rate;
         self.aggregate_reception_rate_bytes_per_second = rx_rate;
 
-        let combined = tx_rate + rx_rate;
+        let combined = tx_rate.saturating_add(rx_rate);
         if combined > self.global_peak_throughput_bytes_per_second {
             self.global_peak_throughput_bytes_per_second = combined;
         }
@@ -123,5 +141,40 @@ impl IpcState {
                 self.recent_alerts.remove(0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpcProcessMetrics, IpcState};
+    use std::string::String;
+
+    #[test]
+    fn finalizing_a_tick_publishes_process_rates_and_peak() {
+        let mut state = IpcState::default();
+        let mut process = IpcProcessMetrics::new(42, String::from("worker"));
+        process.temporal_transmission_accumulator = 400;
+        process.temporal_reception_accumulator = 600;
+        process.peak_throughput_bytes_per_second = 900;
+        state.active_process_telemetry.insert(42, process);
+
+        state.finalize_tick(400, 600);
+
+        let process = &state.active_process_telemetry[&42];
+        assert_eq!(process.transmission_rate_bytes_per_second, 400);
+        assert_eq!(process.reception_rate_bytes_per_second, 600);
+        assert_eq!(process.peak_throughput_bytes_per_second, 1_000);
+    }
+
+    #[test]
+    fn finalizing_a_tick_preserves_a_higher_process_peak() {
+        let mut process = IpcProcessMetrics::new(42, String::from("worker"));
+        process.temporal_transmission_accumulator = 100;
+        process.temporal_reception_accumulator = 200;
+        process.peak_throughput_bytes_per_second = 1_000;
+
+        process.finalize_tick();
+
+        assert_eq!(process.peak_throughput_bytes_per_second, 1_000);
     }
 }
