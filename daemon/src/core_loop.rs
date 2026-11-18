@@ -108,24 +108,13 @@ pub async fn run(mut args: CoreLoopArgs) {
                     .retain(|(shadow_is_tx, key), _| *shadow_is_tx != is_tx || seen.contains(key));
 
                 if !updates.is_empty() {
-                    let port_pid_result = BpfHashMap::<_, u32, u32>::try_from(
-                        args.bpf.map_mut("PORT_TO_PID").unwrap(),
-                    );
                     for (key, metrics, delta_bytes) in updates {
-                        let local_port = if is_tx {
-                            key.source_port
-                        } else {
-                            key.destination_port
-                        };
-                        let resolved = if let Ok(ref pp_map) = port_pid_result {
-                            pp_map
-                                .get(&(local_port as u32), 0)
-                                .ok()
-                                .map(|pid| (pid as i32, "kprobe-pid".to_string()))
-                                .or_else(|| resolve_flow(&registry, &key, is_tx))
-                        } else {
-                            resolve_flow(&registry, &key, is_tx)
-                        };
+                        // eBPF packet hooks do not run in the originating
+                        // process context, so a port-only PID map would be
+                        // both incomplete and unsafe under port reuse.  Use
+                        // the userspace socket snapshot until attribution is
+                        // implemented with a lifecycle-tracked flow key.
+                        let resolved = resolve_flow(&registry, &key, is_tx);
 
                         if let Some((pid, name)) = resolved {
                             let protocol = proto_name(key.protocol);
