@@ -7,10 +7,10 @@ use aya_ebpf::programs::TcContext;
 use mizn_common::bpf::FlowKey;
 
 use crate::headers::{EthernetHeader, IcmpHeader, Ipv4Header, Ipv6Header, TcpHeader, UdpHeader};
-use crate::metrics::update_tx_metrics;
+use crate::metrics::{update_tx_metrics, update_tx_metrics_with_sni};
 use crate::parsing::{
-    ETH_IPV4, ETH_IPV6, PROTO_ICMP, PROTO_ICMP6, PROTO_TCP, PROTO_UDP, ipv4_to_v6_mapped,
-    make_flow_key,
+    ipv4_to_v6_mapped, make_flow_key, ETH_IPV4, ETH_IPV6, PROTO_ICMP, PROTO_ICMP6, PROTO_TCP,
+    PROTO_UDP,
 };
 
 #[inline(always)]
@@ -63,13 +63,18 @@ fn process_transport(
     destination_ip: [u8; 16],
 ) -> Result<(), ()> {
     let packet_len = ctx.len() as u64;
-    let (source_port, destination_port, flags) = match protocol {
+    let (source_port, destination_port, flags, payload_offset) = match protocol {
         PROTO_TCP => {
             let tcp: TcpHeader = load(ctx, offset)?;
+            let header_len = ((tcp.data_offset_reserved >> 4) as usize) << 2;
+            if header_len < core::mem::size_of::<TcpHeader>() {
+                return Err(());
+            }
             (
                 u16::from_be(tcp.source_port),
                 u16::from_be(tcp.destination_port),
                 tcp.flags,
+                offset + header_len,
             )
         }
         PROTO_UDP => {
@@ -78,11 +83,12 @@ fn process_transport(
                 u16::from_be(udp.source_port),
                 u16::from_be(udp.destination_port),
                 0,
+                offset + core::mem::size_of::<UdpHeader>(),
             )
         }
         PROTO_ICMP | PROTO_ICMP6 => {
             let icmp: IcmpHeader = load(ctx, offset)?;
-            (icmp.icmp_type as u16, icmp.code as u16, 0)
+            (icmp.icmp_type as u16, icmp.code as u16, 0, offset)
         }
         _ => return Ok(()),
     };
@@ -96,6 +102,20 @@ fn process_transport(
             protocol,
         )
     };
-    unsafe { update_tx_metrics(&key, packet_len, flags) };
+    unsafe {
+        if protocol == PROTO_TCP || protocol == PROTO_UDP {
+            update_tx_metrics_with_sni(
+                ctx,
+                &key,
+                packet_len,
+                flags,
+                protocol,
+                destination_port,
+                payload_offset,
+            );
+        } else {
+            update_tx_metrics(&key, packet_len, flags);
+        }
+    };
     Ok(())
 }

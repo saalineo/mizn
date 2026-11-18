@@ -4,7 +4,7 @@ use mizn_common::bpf::FlowKey;
 use crate::headers::{EthernetHeader, Ipv4Header, Ipv6Header, TcpHeader, UdpHeader, VxlanHeader};
 use crate::maps::{BLOCKLIST, BLOCKLIST_V6};
 use crate::metrics::update_metrics_with_sni;
-use crate::parsing::{make_flow_key, ptr_at, PROTO_TCP, PROTO_UDP, ETH_IPV4, ETH_IPV6, PORT_VXLAN, PORT_DNS, PORT_HTTP};
+use crate::parsing::{make_flow_key, ptr_at, PROTO_TCP, PROTO_UDP, ETH_IPV4, ETH_IPV6, PORT_VXLAN};
 
 pub struct TransportArgs {
     pub xport_off: usize,

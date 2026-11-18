@@ -6,6 +6,7 @@ use crate::parsing::ipv6::parse_ipv6;
 
 pub mod ipv4;
 pub mod ipv6;
+pub mod names;
 pub mod transport;
 
 pub const PROTO_ICMP:   u8 = 1;
