@@ -3,9 +3,9 @@ use crate::features::process_map::SocketsMap;
 use aya::maps::{HashMap as BpfHashMap, PerCpuHashMap as BpfPerCpuHashMap};
 use mizn_common::bpf::{FlowKey, FlowMetrics};
 use mizn_common::ipc::{IpcProcessMetrics, IpcState};
-use rkyv::ser::serializers::{BufferScratch, BufferSerializer, CompositeSerializer};
-use rkyv::ser::Serializer;
 use rkyv::Infallible;
+use rkyv::ser::Serializer;
+use rkyv::ser::serializers::{BufferScratch, BufferSerializer, CompositeSerializer};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -38,16 +38,31 @@ pub async fn run(mut args: CoreLoopArgs) {
     let mut global_state = IpcState::default();
     let mut serial_buf = [0u8; TELEMETRY_BUFFER_SIZE];
     let mut scratch_buf = [0u8; 4096];
+    let mut unavailable_maps = HashSet::new();
 
     loop {
         tokio::time::sleep(AGGREGATION_INTERVAL).await;
 
-        if let Ok(mut blocklist) =
-            BpfHashMap::<_, u32, u8>::try_from(args.bpf.map_mut("BLOCKLIST").unwrap())
-        {
-            while let Ok(ip) = args.cmd_rx.try_recv() {
-                let _ = blocklist.insert(ip, 1, 0);
-                eprintln!("[miznd] Blocked: {}", std::net::Ipv4Addr::from(ip.to_be()));
+        match args.bpf.map_mut("BLOCKLIST") {
+            Some(map) => match BpfHashMap::<_, u32, u8>::try_from(map) {
+                Ok(mut blocklist) => {
+                    while let Ok(ip) = args.cmd_rx.try_recv() {
+                        let _ = blocklist.insert(ip, 1, 0);
+                        eprintln!("[miznd] Blocked: {}", std::net::Ipv4Addr::from(ip.to_be()));
+                    }
+                }
+                Err(error) => {
+                    if unavailable_maps.insert("BLOCKLIST") {
+                        eprintln!("[miznd] BLOCKLIST map is unusable: {error}");
+                    }
+                    while args.cmd_rx.try_recv().is_ok() {}
+                }
+            },
+            None => {
+                if unavailable_maps.insert("BLOCKLIST") {
+                    eprintln!("[miznd] BPF object is missing required BLOCKLIST map");
+                }
+                while args.cmd_rx.try_recv().is_ok() {}
             }
         }
 
@@ -69,101 +84,112 @@ pub async fn run(mut args: CoreLoopArgs) {
             .as_secs();
 
         for (map_name, is_tx) in [("FLOW_METRICS_RX", false), ("FLOW_METRICS_TX", true)] {
-            if let Ok(flow_map) = BpfPerCpuHashMap::<_, FlowKey, FlowMetrics>::try_from(
-                args.bpf.map_mut(map_name).unwrap(),
-            ) {
-                let mut updates = Vec::new();
-                let mut seen = HashSet::new();
-                for r in flow_map.iter().filter_map(|r| r.ok()) {
-                    let (key, per_cpu_metrics) = r;
-                    seen.insert(key);
-                    let mut metrics = FlowMetrics::default();
-                    for m in per_cpu_metrics.iter() {
-                        metrics.bytes += m.bytes;
-                        metrics.packets += m.packets;
-                        metrics.tcp_flags |= m.tcp_flags;
-                        if metrics.sni[0] == 0 && m.sni[0] != 0 {
-                            metrics.sni = m.sni;
-                        }
+            let Some(map) = args.bpf.map_mut(map_name) else {
+                if unavailable_maps.insert(map_name) {
+                    eprintln!("[miznd] BPF object is missing required {map_name} map");
+                }
+                continue;
+            };
+            let flow_map = match BpfPerCpuHashMap::<_, FlowKey, FlowMetrics>::try_from(map) {
+                Ok(map) => map,
+                Err(error) => {
+                    if unavailable_maps.insert(map_name) {
+                        eprintln!("[miznd] {map_name} map is unusable: {error}");
                     }
-
-                    let prev = bpf_shadow.entry((is_tx, key)).or_default();
-                    // An LRU eviction followed by a new packet for the same
-                    // tuple resets its counters. Treat that snapshot as a new
-                    // flow instead of turning the reset into a wrapped u64
-                    // delta.
-                    let delta_bytes = metrics
-                        .bytes
-                        .checked_sub(prev.bytes)
-                        .unwrap_or(metrics.bytes);
-                    *prev = metrics;
-                    if delta_bytes > 0 {
-                        updates.push((key, metrics, delta_bytes));
+                    continue;
+                }
+            };
+            let mut updates = Vec::new();
+            let mut seen = HashSet::new();
+            for r in flow_map.iter().filter_map(|r| r.ok()) {
+                let (key, per_cpu_metrics) = r;
+                seen.insert(key);
+                let mut metrics = FlowMetrics::default();
+                for m in per_cpu_metrics.iter() {
+                    metrics.bytes += m.bytes;
+                    metrics.packets += m.packets;
+                    metrics.tcp_flags |= m.tcp_flags;
+                    if metrics.sni[0] == 0 && m.sni[0] != 0 {
+                        metrics.sni = m.sni;
                     }
                 }
 
-                // LRU eviction removes keys from the BPF map without notifying
-                // userspace. Drop their corresponding snapshots after every
-                // successful walk so the userspace table has the same bound as
-                // the kernel flow table.
-                bpf_shadow
-                    .retain(|(shadow_is_tx, key), _| *shadow_is_tx != is_tx || seen.contains(key));
+                let prev = bpf_shadow.entry((is_tx, key)).or_default();
+                // An LRU eviction followed by a new packet for the same
+                // tuple resets its counters. Treat that snapshot as a new
+                // flow instead of turning the reset into a wrapped u64
+                // delta.
+                let delta_bytes = metrics
+                    .bytes
+                    .checked_sub(prev.bytes)
+                    .unwrap_or(metrics.bytes);
+                *prev = metrics;
+                if delta_bytes > 0 {
+                    updates.push((key, metrics, delta_bytes));
+                }
+            }
 
-                if !updates.is_empty() {
-                    for (key, metrics, delta_bytes) in updates {
-                        // eBPF packet hooks do not run in the originating
-                        // process context, so a port-only PID map would be
-                        // both incomplete and unsafe under port reuse.  Use
-                        // the userspace socket snapshot until attribution is
-                        // implemented with a lifecycle-tracked flow key.
-                        let resolved = resolve_flow(&registry, &key, is_tx);
+            // LRU eviction removes keys from the BPF map without notifying
+            // userspace. Drop their corresponding snapshots after every
+            // successful walk so the userspace table has the same bound as
+            // the kernel flow table.
+            bpf_shadow
+                .retain(|(shadow_is_tx, key), _| *shadow_is_tx != is_tx || seen.contains(key));
 
-                        if let Some((pid, name)) = resolved {
-                            let protocol = proto_name(key.protocol);
-                            let sni = String::from_utf8_lossy(&metrics.sni)
-                                .trim_matches(char::from(0))
-                                .to_string();
-                            if let Ok(conn) = args.db.lock() {
-                                let _ = database::record_flow(
-                                    &conn,
-                                    ts,
-                                    pid,
-                                    &name,
-                                    delta_bytes,
-                                    &sni,
-                                    protocol,
-                                );
-                            }
+            if !updates.is_empty() {
+                for (key, metrics, delta_bytes) in updates {
+                    // eBPF packet hooks do not run in the originating
+                    // process context, so a port-only PID map would be
+                    // both incomplete and unsafe under port reuse.  Use
+                    // the userspace socket snapshot until attribution is
+                    // implemented with a lifecycle-tracked flow key.
+                    let resolved = resolve_flow(&registry, &key, is_tx);
 
-                            let entry = global_state
-                                .active_process_telemetry
-                                .entry(pid)
-                                .or_insert_with(|| IpcProcessMetrics::new(pid, name));
-                            entry.update_from_delta(delta_bytes, is_tx, &metrics);
-                            let remote_ip = if is_tx {
-                                key.destination_ip
-                            } else {
-                                key.source_ip
-                            };
-                            let remote_ipv4 =
-                                if remote_ip[0..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {
-                                    Some(u32::from_be_bytes([
-                                        remote_ip[12],
-                                        remote_ip[13],
-                                        remote_ip[14],
-                                        remote_ip[15],
-                                    ]))
-                                } else {
-                                    None
-                                };
-                            entry.last_resolved_remote_peer_ipv4 = remote_ipv4;
-                            if !sni.is_empty() {
-                                entry.sni = sni;
-                            }
-
-                            dtx += delta_bytes * (is_tx as u64);
-                            drx += delta_bytes * (!is_tx as u64);
+                    if let Some((pid, name)) = resolved {
+                        let protocol = proto_name(key.protocol);
+                        let sni = String::from_utf8_lossy(&metrics.sni)
+                            .trim_matches(char::from(0))
+                            .to_string();
+                        if let Ok(conn) = args.db.lock() {
+                            let _ = database::record_flow(
+                                &conn,
+                                ts,
+                                pid,
+                                &name,
+                                delta_bytes,
+                                &sni,
+                                protocol,
+                            );
                         }
+
+                        let entry = global_state
+                            .active_process_telemetry
+                            .entry(pid)
+                            .or_insert_with(|| IpcProcessMetrics::new(pid, name));
+                        entry.update_from_delta(delta_bytes, is_tx, &metrics);
+                        let remote_ip = if is_tx {
+                            key.destination_ip
+                        } else {
+                            key.source_ip
+                        };
+                        let remote_ipv4 =
+                            if remote_ip[0..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {
+                                Some(u32::from_be_bytes([
+                                    remote_ip[12],
+                                    remote_ip[13],
+                                    remote_ip[14],
+                                    remote_ip[15],
+                                ]))
+                            } else {
+                                None
+                            };
+                        entry.last_resolved_remote_peer_ipv4 = remote_ipv4;
+                        if !sni.is_empty() {
+                            entry.sni = sni;
+                        }
+
+                        dtx += delta_bytes * (is_tx as u64);
+                        drx += delta_bytes * (!is_tx as u64);
                     }
                 }
             }
@@ -299,7 +325,7 @@ where
 mod tests {
     use super::write_telemetry_frame;
     use std::time::Duration;
-    use tokio::io::{duplex, AsyncReadExt};
+    use tokio::io::{AsyncReadExt, duplex};
 
     #[tokio::test]
     async fn writes_length_prefixed_telemetry_frame() {

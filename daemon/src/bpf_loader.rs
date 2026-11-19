@@ -1,3 +1,4 @@
+use anyhow::{Context, anyhow};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpFlags, tc};
 use aya::{Ebpf, include_bytes_aligned};
 
@@ -11,7 +12,11 @@ impl BpfContext {
             "../../target/bpfel-unknown-none/release/mizn-ebpf"
         ))?;
 
-        let program: &mut Xdp = bpf.program_mut("mizn_ebpf").unwrap().try_into()?;
+        let program: &mut Xdp = bpf
+            .program_mut("mizn_ebpf")
+            .ok_or_else(|| anyhow!("BPF object is missing required XDP program 'mizn_ebpf'"))?
+            .try_into()
+            .context("BPF program 'mizn_ebpf' has an unexpected type")?;
         program.load()?;
         program.attach(iface, XdpFlags::default())?;
 
@@ -24,7 +29,11 @@ impl BpfContext {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err.into()),
         }
-        let egress: &mut SchedClassifier = bpf.program_mut("mizn_tc_egress").unwrap().try_into()?;
+        let egress: &mut SchedClassifier = bpf
+            .program_mut("mizn_tc_egress")
+            .ok_or_else(|| anyhow!("BPF object is missing required TC program 'mizn_tc_egress'"))?
+            .try_into()
+            .context("BPF program 'mizn_tc_egress' has an unexpected type")?;
         egress.load()?;
         egress.attach(iface, TcAttachType::Egress)?;
 
