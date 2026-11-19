@@ -9,11 +9,13 @@ use rkyv::Infallible;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 const TELEMETRY_BUFFER_SIZE: usize = 524288;
 const AGGREGATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct CoreLoopArgs {
     pub bpf: aya::Ebpf,
@@ -251,13 +253,75 @@ pub fn proto_name(p: u8) -> &'static str {
 }
 
 async fn broadcast(conns: &Arc<RwLock<Vec<tokio::net::UnixStream>>>, data: &[u8]) {
-    let mut guard = conns.write().await;
-    let data_len = data.len() as u32;
-    let mut active = Vec::with_capacity(guard.len());
-    for mut c in guard.drain(..) {
-        if c.write_u32(data_len).await.is_ok() && c.write_all(data).await.is_ok() {
-            active.push(c);
-        }
+    // Take ownership of every current connection before spawning writes so a
+    // stalled client never keeps the aggregation loop (or the connection
+    // registry lock) waiting. A healthy client is added back by its task.
+    let clients = {
+        let mut guard = conns.write().await;
+        std::mem::take(&mut *guard)
+    };
+    let frame: Arc<[u8]> = Arc::from(data);
+
+    for mut client in clients {
+        let conns = Arc::clone(conns);
+        let frame = Arc::clone(&frame);
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                CLIENT_WRITE_TIMEOUT,
+                write_telemetry_frame(&mut client, frame.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(())) => conns.write().await.push(client),
+                Ok(Err(error)) => {
+                    eprintln!("[miznd] dropping telemetry client after write error: {error}");
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[miznd] dropping telemetry client after {}s write timeout",
+                        CLIENT_WRITE_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        });
     }
-    *guard = active;
+}
+
+async fn write_telemetry_frame<W>(writer: &mut W, data: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_u32(data.len() as u32).await?;
+    writer.write_all(data).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_telemetry_frame;
+    use std::time::Duration;
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn writes_length_prefixed_telemetry_frame() {
+        let (mut writer, mut reader) = duplex(64);
+        write_telemetry_frame(&mut writer, b"state").await.unwrap();
+
+        let mut frame = [0; 9];
+        reader.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame[..4], &(5u32).to_be_bytes());
+        assert_eq!(&frame[4..], b"state");
+    }
+
+    #[tokio::test]
+    async fn stalled_telemetry_write_can_be_timed_out() {
+        let (mut writer, _reader) = duplex(1);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            write_telemetry_frame(&mut writer, b"state"),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
 }
