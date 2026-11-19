@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
@@ -6,6 +6,28 @@ use mizn_common::ipc::{IpcCommand, IPC_COMMAND_MAX_FRAME_SIZE};
 
 const SOCKET_GROUP_ENV: &str = "MIZN_SOCKET_GROUP";
 const DEFAULT_SOCKET_GROUP: &str = "mizn";
+const PRIVATE_SOCKET_UMASK: libc::mode_t = 0o077;
+
+// umask is process-global. Serializing MIZN's socket binds keeps the
+// restrictive window small and ensures that each caller restores the umask it
+// observed before binding.
+static SOCKET_BIND_UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+struct UmaskGuard(libc::mode_t);
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe { libc::umask(self.0) };
+    }
+}
+
+fn bind_private_socket(path: &str) -> Result<UnixListener, std::io::Error> {
+    let _lock = SOCKET_BIND_UMASK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let previous_umask = unsafe { libc::umask(PRIVATE_SOCKET_UMASK) };
+    let _restore_umask = UmaskGuard(previous_umask);
+
+    UnixListener::bind(path)
+}
 
 fn configure_socket(path: &str) -> Result<(), std::io::Error> {
     use std::ffi::CString;
@@ -36,7 +58,7 @@ fn configure_socket(path: &str) -> Result<(), std::io::Error> {
 pub fn start_telemetry_socket() -> Result<Arc<RwLock<Vec<tokio::net::UnixStream>>>, std::io::Error> {
     let socket_path = "/run/miznd.sock";
     let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = bind_private_socket(socket_path)?;
     configure_socket(socket_path)?;
 
     let connections = Arc::new(RwLock::new(Vec::<tokio::net::UnixStream>::with_capacity(16)));
@@ -55,7 +77,7 @@ pub fn start_command_socket() -> Result<tokio::sync::mpsc::UnboundedReceiver<u32
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     let cmd_socket_path = "/run/miznd_cmd.sock";
     let _ = std::fs::remove_file(cmd_socket_path);
-    let cmd_listener = UnixListener::bind(cmd_socket_path)?;
+    let cmd_listener = bind_private_socket(cmd_socket_path)?;
     configure_socket(cmd_socket_path)?;
     
     tokio::spawn(async move {
