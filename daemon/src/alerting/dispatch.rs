@@ -1,15 +1,73 @@
 use super::SmtpConfig;
+use hyper::header::CONTENT_TYPE;
+use hyper::{Body, Client, Request, StatusCode};
+use hyper_tls::HttpsConnector;
+use std::time::Duration;
+
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn webhook_payload(level: &str, message: &str) -> String {
+    serde_json::json!({
+        "text": format!("[MIZN][{}] {}", level, message),
+    })
+    .to_string()
+}
 
 pub async fn dispatch_webhook(url: &str, level: &str, message: &str) {
-    let payload = format!(r#"{{"text":"[MIZN][{}] {}"}}"#, level, message.replace('"', "'"));
+    let payload = webhook_payload(level, message);
     eprintln!("[miznd][alert][webhook] → {}", payload);
 
-    let url     = url.to_string();
-    
-    let _ = tokio::task::spawn_blocking(move || {
-        eprintln!("[miznd][alert][webhook][would-post] {}", url);
-        let _ = payload;
-    }).await;
+    let request = match Request::post(url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(payload))
+    {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("[miznd][alert][webhook] invalid URL {}: {}", url, error);
+            return;
+        }
+    };
+
+    let client = Client::builder().build::<_, Body>(HttpsConnector::new());
+    match tokio::time::timeout(WEBHOOK_TIMEOUT, client.request(request)).await {
+        Ok(Ok(response)) if response.status().is_success() => {
+            eprintln!(
+                "[miznd][alert][webhook] posted to {} ({})",
+                url,
+                response.status()
+            );
+        }
+        Ok(Ok(response)) => {
+            let status: StatusCode = response.status();
+            eprintln!(
+                "[miznd][alert][webhook] POST to {} failed with {}",
+                url, status
+            );
+        }
+        Ok(Err(error)) => {
+            eprintln!("[miznd][alert][webhook] POST to {} failed: {}", url, error);
+        }
+        Err(_) => {
+            eprintln!(
+                "[miznd][alert][webhook] POST to {} timed out after {}s",
+                url,
+                WEBHOOK_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::webhook_payload;
+
+    #[test]
+    fn webhook_payload_escapes_message_as_json() {
+        let payload = webhook_payload("Warning", "quote: \" and newline:\n");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(value["text"], "[MIZN][Warning] quote: \" and newline:\n");
+    }
 }
 
 pub async fn dispatch_smtp(smtp: &SmtpConfig, message: &str) {

@@ -1293,6 +1293,8 @@ dependencies = [
  "bytemuck",
  "clickhouse",
  "etherparse",
+ "hyper",
+ "hyper-tls",
  "lettre",
  "libc",
  "maxminddb",
@@ -1305,6 +1307,7 @@ dependencies = [
  "rkyv",
  "rusqlite",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
