@@ -71,20 +71,40 @@ mod tests {
 }
 
 pub async fn dispatch_smtp(smtp: &SmtpConfig, message: &str) {
+    let smtp = smtp.clone();
+    let message = message.to_owned();
+    let result = tokio::task::spawn_blocking(move || send_smtp(smtp, message)).await;
+
+    if let Err(error) = result {
+        eprintln!("[miznd][smtp] Send task failed: {}", error);
+    }
+}
+
+fn send_smtp(smtp: SmtpConfig, message: String) {
     use lettre::message::header::ContentType;
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{Message, SmtpTransport, Transport};
 
     let email_result = Message::builder()
-        .from(smtp.from.parse().unwrap_or_else(|_| "mizn@localhost".parse().unwrap()))
-        .to(smtp.to.parse().unwrap_or_else(|_| "admin@localhost".parse().unwrap()))
+        .from(
+            smtp.from
+                .parse()
+                .unwrap_or_else(|_| "mizn@localhost".parse().unwrap()),
+        )
+        .to(smtp
+            .to
+            .parse()
+            .unwrap_or_else(|_| "admin@localhost".parse().unwrap()))
         .subject("[MIZN ALERT] Security event detected")
         .header(ContentType::TEXT_PLAIN)
-        .body(message.to_string());
+        .body(message);
 
     let email = match email_result {
-        Ok(e)  => e,
-        Err(e) => { eprintln!("[miznd][smtp] message build error: {}", e); return; }
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[miznd][smtp] message build error: {}", e);
+            return;
+        }
     };
 
     let creds = Credentials::new(smtp.username.clone(), smtp.password.clone());
@@ -92,7 +112,7 @@ pub async fn dispatch_smtp(smtp: &SmtpConfig, message: &str) {
 
     match mailer {
         Ok(m) => match m.send(&email) {
-            Ok(_)  => eprintln!("[miznd][smtp] Alert sent to {}", smtp.to),
+            Ok(_) => eprintln!("[miznd][smtp] Alert sent to {}", smtp.to),
             Err(e) => eprintln!("[miznd][smtp] Send error: {}", e),
         },
         Err(e) => eprintln!("[miznd][smtp] Relay error: {}", e),
