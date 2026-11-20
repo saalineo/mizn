@@ -36,7 +36,7 @@ pub fn draw_security_panel(f: &mut Frame, app: &AppState, area: Rect) {
     let blocked_items: Vec<ListItem> = if app.blocked_ips.is_empty() {
         vec![ListItem::new(Span::styled("    No blocked IPs — press [B] to drop top host", Style::default().fg(C_DIM)))]
     } else {
-        app.blocked_ips.iter().rev().take(halves[1].height.saturating_sub(3) as usize).map(|entry| {
+        app.blocked_ips.iter().rev().take(halves[1].height.saturating_sub(3) as usize).map(|(_, entry)| {
             ListItem::new(Span::styled(format!("  {}", entry), Style::default().fg(C_BLOCKED).add_modifier(Modifier::BOLD)))
         }).collect()
     };

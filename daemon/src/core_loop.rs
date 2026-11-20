@@ -1,25 +1,31 @@
 use crate::core::database;
 use crate::features::process_map::SocketsMap;
-use aya::maps::{HashMap as BpfHashMap, PerCpuHashMap as BpfPerCpuHashMap};
+use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuHashMap as BpfPerCpuHashMap};
 use mizn_common::bpf::{FlowKey, FlowMetrics};
-use mizn_common::ipc::{IpcProcessMetrics, IpcState};
+use mizn_common::ipc::{IpcAddress, IpcCommand, IpcProcessMetrics, IpcState};
 use rkyv::Infallible;
 use rkyv::ser::Serializer;
 use rkyv::ser::serializers::{BufferScratch, BufferSerializer, CompositeSerializer};
 use rusqlite::Connection;
+use std::borrow::BorrowMut;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 const TELEMETRY_BUFFER_SIZE: usize = 524288;
 const AGGREGATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const BLOCK_DURATION: Duration = Duration::from_secs(15 * 60);
+const BLOCKLIST_V4_CAPACITY: usize = 1_024;
+const BLOCKLIST_V6_CAPACITY: usize = 256;
 
 pub struct CoreLoopArgs {
     pub bpf: aya::Ebpf,
-    pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    pub cmd_rx: tokio::sync::mpsc::UnboundedReceiver<IpcCommand>,
     pub ch_sender: Option<tokio::sync::mpsc::UnboundedSender<Vec<IpcProcessMetrics>>>,
     pub alert_tx: tokio::sync::mpsc::UnboundedSender<IpcState>,
     pub ui_alert_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -39,30 +45,91 @@ pub async fn run(mut args: CoreLoopArgs) {
     let mut serial_buf = [0u8; TELEMETRY_BUFFER_SIZE];
     let mut scratch_buf = [0u8; 4096];
     let mut unavailable_maps = HashSet::new();
+    let mut active_blocks = HashMap::<IpcAddress, Instant>::new();
+    let mut installed_v4 = HashSet::new();
+    let mut installed_v6 = HashSet::new();
 
     loop {
         tokio::time::sleep(AGGREGATION_INTERVAL).await;
 
+        let now = Instant::now();
+        while let Ok(command) = args.cmd_rx.try_recv() {
+            match command {
+                IpcCommand::BlockIp(address) if is_protected_address(&address) => {
+                    eprintln!("[miznd] refusing to block protected address: {address:?}");
+                }
+                IpcCommand::BlockIp(address) => {
+                    if !can_add_block(&active_blocks, &address) {
+                        eprintln!("[miznd] refusing {address:?}: blocklist is full");
+                    } else {
+                        active_blocks.insert(address.clone(), now + BLOCK_DURATION);
+                        eprintln!(
+                            "[miznd] blocking {address:?} for {}s",
+                            BLOCK_DURATION.as_secs()
+                        );
+                    }
+                }
+                IpcCommand::UnblockIp(address) => {
+                    active_blocks.remove(&address);
+                    eprintln!("[miznd] unblocked {address:?}");
+                }
+            }
+        }
+        expire_blocks(&mut active_blocks, now);
+
+        let desired_v4 = active_blocks
+            .keys()
+            .filter_map(|address| match address {
+                IpcAddress::V4(bytes) => Some(u32::from_ne_bytes(*bytes)),
+                IpcAddress::V6(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        let desired_v6 = active_blocks
+            .keys()
+            .filter_map(|address| match address {
+                IpcAddress::V4(_) => None,
+                IpcAddress::V6(bytes) => Some(*bytes),
+            })
+            .collect::<HashSet<_>>();
+
         match args.bpf.map_mut("BLOCKLIST") {
             Some(map) => match BpfHashMap::<_, u32, u8>::try_from(map) {
                 Ok(mut blocklist) => {
-                    while let Ok(ip) = args.cmd_rx.try_recv() {
-                        let _ = blocklist.insert(ip, 1, 0);
-                        eprintln!("[miznd] Blocked: {}", std::net::Ipv4Addr::from(ip.to_be()));
-                    }
+                    sync_blocklist(&mut blocklist, &desired_v4, &mut installed_v4, "BLOCKLIST");
                 }
                 Err(error) => {
                     if unavailable_maps.insert("BLOCKLIST") {
                         eprintln!("[miznd] BLOCKLIST map is unusable: {error}");
                     }
-                    while args.cmd_rx.try_recv().is_ok() {}
                 }
             },
             None => {
                 if unavailable_maps.insert("BLOCKLIST") {
                     eprintln!("[miznd] BPF object is missing required BLOCKLIST map");
                 }
-                while args.cmd_rx.try_recv().is_ok() {}
+            }
+        }
+
+        match args.bpf.map_mut("BLOCKLIST_V6") {
+            Some(map) => match BpfHashMap::<_, [u8; 16], u8>::try_from(map) {
+                Ok(mut blocklist) => {
+                    sync_blocklist(
+                        &mut blocklist,
+                        &desired_v6,
+                        &mut installed_v6,
+                        "BLOCKLIST_V6",
+                    );
+                }
+                Err(error) => {
+                    if unavailable_maps.insert("BLOCKLIST_V6") {
+                        eprintln!("[miznd] BLOCKLIST_V6 map is unusable: {error}");
+                    }
+                }
+            },
+            None => {
+                if unavailable_maps.insert("BLOCKLIST_V6") {
+                    eprintln!("[miznd] BPF object is missing required BLOCKLIST_V6 map");
+                }
             }
         }
 
@@ -256,6 +323,130 @@ pub async fn run(mut args: CoreLoopArgs) {
     }
 }
 
+fn sync_blocklist<T, K>(
+    map: &mut BpfHashMap<T, K, u8>,
+    desired: &HashSet<K>,
+    installed: &mut HashSet<K>,
+    name: &str,
+) where
+    T: BorrowMut<MapData>,
+    K: aya::Pod + Copy + Eq + Hash + std::fmt::Debug,
+{
+    for key in installed.difference(desired).copied().collect::<Vec<_>>() {
+        match map.remove(&key) {
+            Ok(()) => {
+                installed.remove(&key);
+            }
+            Err(error) => eprintln!("[miznd] failed to remove {key:?} from {name}: {error}"),
+        }
+    }
+    for key in desired.difference(installed).copied().collect::<Vec<_>>() {
+        match map.insert(key, 1, 0) {
+            Ok(()) => {
+                installed.insert(key);
+            }
+            Err(error) => eprintln!("[miznd] failed to insert {key:?} into {name}: {error}"),
+        }
+    }
+}
+
+fn expire_blocks(blocks: &mut HashMap<IpcAddress, Instant>, now: Instant) {
+    blocks.retain(|_, expires_at| *expires_at > now);
+}
+
+fn can_add_block(blocks: &HashMap<IpcAddress, Instant>, address: &IpcAddress) -> bool {
+    let limit = match address {
+        IpcAddress::V4(_) => BLOCKLIST_V4_CAPACITY,
+        IpcAddress::V6(_) => BLOCKLIST_V6_CAPACITY,
+    };
+    blocks.contains_key(address)
+        || blocks
+            .keys()
+            .filter(|active| std::mem::discriminant(*active) == std::mem::discriminant(address))
+            .count()
+            < limit
+}
+
+fn is_protected_address(address: &IpcAddress) -> bool {
+    is_protected_by_policy(address, &protected_network_addresses())
+}
+
+fn is_protected_by_policy(address: &IpcAddress, protected: &HashSet<IpcAddress>) -> bool {
+    match address {
+        IpcAddress::V4(bytes) if bytes[0] == 127 => true,
+        IpcAddress::V6(bytes) if *bytes == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] => true,
+        _ => protected.contains(address),
+    }
+}
+
+fn protected_network_addresses() -> HashSet<IpcAddress> {
+    let mut protected = HashSet::new();
+
+    if let Ok(routes) = std::fs::read_to_string("/proc/net/route") {
+        for line in routes.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let (Some(destination), Some(gateway), Some(flags)) =
+                (fields.get(1), fields.get(2), fields.get(3))
+            else {
+                continue;
+            };
+            if *destination == "00000000"
+                && u16::from_str_radix(flags, 16).is_ok_and(|flags| flags & 0x2 != 0)
+                && let Ok(gateway) = u32::from_str_radix(gateway, 16)
+            {
+                protected.insert(IpcAddress::V4(gateway.to_ne_bytes()));
+            }
+        }
+    }
+
+    if let Ok(routes) = std::fs::read_to_string("/proc/net/ipv6_route") {
+        for line in routes.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let (Some(destination), Some(prefix), Some(gateway)) =
+                (fields.first(), fields.get(1), fields.get(4))
+            else {
+                continue;
+            };
+            if *destination == "00000000000000000000000000000000" && *prefix == "00" {
+                if let Some(gateway) = parse_ipv6_hex(gateway) {
+                    protected.insert(IpcAddress::V6(gateway));
+                }
+            }
+        }
+    }
+
+    if let Ok(resolv_conf) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in resolv_conf.lines() {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("nameserver") {
+                continue;
+            }
+            match fields.next().and_then(|value| value.parse::<IpAddr>().ok()) {
+                Some(IpAddr::V4(address)) => {
+                    protected.insert(IpcAddress::V4(address.octets()));
+                }
+                Some(IpAddr::V6(address)) => {
+                    protected.insert(IpcAddress::V6(address.octets()));
+                }
+                None => {}
+            }
+        }
+    }
+
+    protected
+}
+
+fn parse_ipv6_hex(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
 pub fn resolve_flow(reg: &SocketsMap, key: &FlowKey, is_tx: bool) -> Option<(i32, String)> {
     // Direction comes from the capture hook.  Only the local endpoint is used
     // for attribution, never to determine direction.
@@ -323,8 +514,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::write_telemetry_frame;
-    use std::time::Duration;
+    use super::{can_add_block, expire_blocks, is_protected_address, is_protected_by_policy, write_telemetry_frame, BLOCKLIST_V6_CAPACITY};
+    use mizn_common::ipc::IpcAddress;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, duplex};
 
     #[tokio::test]
@@ -349,5 +542,55 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn loopback_addresses_are_never_blockable() {
+        assert!(is_protected_address(&IpcAddress::V4([127, 0, 0, 1])));
+        assert!(is_protected_address(&IpcAddress::V6([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ])));
+    }
+
+    #[test]
+    fn gateways_and_resolvers_are_never_blockable() {
+        let protected = HashSet::from([
+            IpcAddress::V4([192, 0, 2, 1]),
+            IpcAddress::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 53]),
+        ]);
+
+        assert!(is_protected_by_policy(&IpcAddress::V4([192, 0, 2, 1]), &protected));
+        assert!(is_protected_by_policy(
+            &IpcAddress::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 53]),
+            &protected,
+        ));
+    }
+
+    #[test]
+    fn expired_blocks_are_removed() {
+        let now = Instant::now();
+        let mut blocks = HashMap::from([
+            (IpcAddress::V4([192, 0, 2, 1]), now - Duration::from_secs(1)),
+            (IpcAddress::V6([2; 16]), now + Duration::from_secs(1)),
+        ]);
+
+        expire_blocks(&mut blocks, now);
+
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks.contains_key(&IpcAddress::V6([2; 16])));
+    }
+
+    #[test]
+    fn blocklist_capacity_is_enforced_per_ip_family() {
+        let now = Instant::now();
+        let mut blocks = HashMap::new();
+        for value in 0..BLOCKLIST_V6_CAPACITY {
+            let mut address = [0; 16];
+            address[0] = value as u8;
+            blocks.insert(IpcAddress::V6(address), now);
+        }
+
+        assert!(!can_add_block(&blocks, &IpcAddress::V6([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])));
+        assert!(can_add_block(&blocks, &IpcAddress::V6([42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])));
     }
 }

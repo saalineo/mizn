@@ -9,10 +9,18 @@ pub const IPC_COMMAND_MAX_FRAME_SIZE: usize = 64 * 1024;
 /// Maximum serialized telemetry state frame accepted by the TUI.
 pub const IPC_STATE_MAX_FRAME_SIZE: usize = 1024 * 1024;
 
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[archive(check_bytes)]
+pub enum IpcAddress {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 #[archive(check_bytes)]
 pub enum IpcCommand {
-    BlockIp(u32),
+    BlockIp(IpcAddress),
+    UnblockIp(IpcAddress),
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]

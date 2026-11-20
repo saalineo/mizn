@@ -59,6 +59,8 @@ fn draw_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Span::styled("Quit  ", Style::default().fg(C_LABEL)),
         Span::styled("[B] ", Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD)),
         Span::styled("Block Top IP  ", Style::default().fg(C_LABEL)),
+        Span::styled("[U] ", Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD)),
+        Span::styled("Unblock Last  ", Style::default().fg(C_LABEL)),
         Span::styled("MIZN", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(" · kernel agent active ", Style::default().fg(C_DIM)),
     ]);

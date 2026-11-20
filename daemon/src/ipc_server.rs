@@ -1,8 +1,8 @@
+use mizn_common::ipc::{IPC_COMMAND_MAX_FRAME_SIZE, IpcAddress, IpcCommand};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
-use mizn_common::ipc::{IpcCommand, IPC_COMMAND_MAX_FRAME_SIZE};
 
 const SOCKET_GROUP_ENV: &str = "MIZN_SOCKET_GROUP";
 const DEFAULT_SOCKET_GROUP: &str = "mizn";
@@ -22,7 +22,9 @@ impl Drop for UmaskGuard {
 }
 
 fn bind_private_socket(path: &str) -> Result<UnixListener, std::io::Error> {
-    let _lock = SOCKET_BIND_UMASK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _lock = SOCKET_BIND_UMASK_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let previous_umask = unsafe { libc::umask(PRIVATE_SOCKET_UMASK) };
     let _restore_umask = UmaskGuard(previous_umask);
 
@@ -31,12 +33,15 @@ fn bind_private_socket(path: &str) -> Result<UnixListener, std::io::Error> {
 
 fn configure_socket(path: &str) -> Result<(), std::io::Error> {
     use std::ffi::CString;
-    use std::os::unix::fs::{chown, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, chown};
 
-    let group_name = std::env::var(SOCKET_GROUP_ENV)
-        .unwrap_or_else(|_| DEFAULT_SOCKET_GROUP.to_string());
+    let group_name =
+        std::env::var(SOCKET_GROUP_ENV).unwrap_or_else(|_| DEFAULT_SOCKET_GROUP.to_string());
     let group_name_c = CString::new(group_name.clone()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid socket group name")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid socket group name",
+        )
     })?;
 
     let group_entry = unsafe { libc::getgrnam(group_name_c.as_ptr()) };
@@ -55,15 +60,18 @@ fn configure_socket(path: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-pub fn start_telemetry_socket() -> Result<Arc<RwLock<Vec<tokio::net::UnixStream>>>, std::io::Error> {
+pub fn start_telemetry_socket() -> Result<Arc<RwLock<Vec<tokio::net::UnixStream>>>, std::io::Error>
+{
     let socket_path = "/run/miznd.sock";
     let _ = std::fs::remove_file(socket_path);
     let listener = bind_private_socket(socket_path)?;
     configure_socket(socket_path)?;
 
-    let connections = Arc::new(RwLock::new(Vec::<tokio::net::UnixStream>::with_capacity(16)));
+    let connections = Arc::new(RwLock::new(Vec::<tokio::net::UnixStream>::with_capacity(
+        16,
+    )));
     let conns = connections.clone();
-    
+
     tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
             conns.write().await.push(s);
@@ -73,21 +81,22 @@ pub fn start_telemetry_socket() -> Result<Arc<RwLock<Vec<tokio::net::UnixStream>
     Ok(connections)
 }
 
-pub fn start_command_socket() -> Result<tokio::sync::mpsc::UnboundedReceiver<u32>, std::io::Error> {
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+pub fn start_command_socket()
+-> Result<tokio::sync::mpsc::UnboundedReceiver<IpcCommand>, std::io::Error> {
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<IpcCommand>();
     let cmd_socket_path = "/run/miznd_cmd.sock";
     let _ = std::fs::remove_file(cmd_socket_path);
     let cmd_listener = bind_private_socket(cmd_socket_path)?;
     configure_socket(cmd_socket_path)?;
-    
+
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = cmd_listener.accept().await {
             let tx = cmd_tx.clone();
             tokio::spawn(async move {
                 loop {
                     match read_command(&mut stream).await {
-                        Ok(Some(IpcCommand::BlockIp(ip))) => {
-                            let _ = tx.send(ip);
+                        Ok(Some(command)) => {
+                            let _ = tx.send(command);
                         }
                         Ok(None) => break,
                         Err(error) => {
@@ -136,7 +145,7 @@ where
 mod tests {
     use super::*;
     use rkyv::ser::Serializer;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{AsyncWriteExt, duplex};
 
     fn serialize_command(command: &IpcCommand) -> Vec<u8> {
         let mut buffer = [0u8; 128];
@@ -162,26 +171,32 @@ mod tests {
     #[tokio::test]
     async fn reads_fragmented_command_frame() {
         let (mut writer, mut reader) = duplex(128);
-        let bytes = frame(&IpcCommand::BlockIp(0x7f000001));
+        let bytes = frame(&IpcCommand::BlockIp(IpcAddress::V4([127, 0, 0, 1])));
         let split = 2;
         writer.write_all(&bytes[..split]).await.unwrap();
         writer.write_all(&bytes[split..]).await.unwrap();
 
         assert!(matches!(
             read_command(&mut reader).await.unwrap(),
-            Some(IpcCommand::BlockIp(0x7f000001))
+            Some(IpcCommand::BlockIp(IpcAddress::V4([127, 0, 0, 1])))
         ));
     }
 
     #[tokio::test]
     async fn reads_multiple_coalesced_command_frames() {
         let (mut writer, mut reader) = duplex(256);
-        let mut bytes = frame(&IpcCommand::BlockIp(1));
-        bytes.extend_from_slice(&frame(&IpcCommand::BlockIp(2)));
+        let mut bytes = frame(&IpcCommand::BlockIp(IpcAddress::V4([1, 1, 1, 1])));
+        bytes.extend_from_slice(&frame(&IpcCommand::UnblockIp(IpcAddress::V6([2; 16]))));
         writer.write_all(&bytes).await.unwrap();
 
-        assert!(matches!(read_command(&mut reader).await.unwrap(), Some(IpcCommand::BlockIp(1))));
-        assert!(matches!(read_command(&mut reader).await.unwrap(), Some(IpcCommand::BlockIp(2))));
+        assert!(matches!(
+            read_command(&mut reader).await.unwrap(),
+            Some(IpcCommand::BlockIp(IpcAddress::V4([1, 1, 1, 1])))
+        ));
+        assert!(matches!(
+            read_command(&mut reader).await.unwrap(),
+            Some(IpcCommand::UnblockIp(IpcAddress::V6(bytes))) if bytes == [2; 16]
+        ));
     }
 
     #[tokio::test]

@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('b') => app.block_top_ip(),
+                    KeyCode::Char('u') | KeyCode::Char('U') => app.unblock_last_ip(),
                     KeyCode::Char('1') => app.view_mode = app::ViewMode::Default,
                     KeyCode::Char('2') => app.view_mode = app::ViewMode::Table,
                     KeyCode::Char('3') => app.view_mode = app::ViewMode::Graph,

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use mizn_common::ipc::{IpcState, IpcCommand};
+use mizn_common::ipc::{IpcAddress, IpcCommand, IpcState};
 use rkyv::ser::Serializer;
 use std::io::Write;
 
@@ -11,7 +11,7 @@ pub enum ViewMode {
 
 pub struct AppState {
     pub telemetry:   IpcState,
-    pub blocked_ips: VecDeque<String>,
+    pub blocked_ips: VecDeque<(IpcAddress, String)>,
     pub iface:       String,
     pub view_mode:   ViewMode,
     pub selected_index: usize,
@@ -101,9 +101,8 @@ impl AppState {
         procs.get(self.selected_index).and_then(|pm| pm.last_resolved_remote_peer_ipv4)
     }
 
-    pub fn block_ip(&mut self, ip: u32) {
+    fn send_command(&self, cmd: IpcCommand) -> bool {
         if let Ok(mut sock) = std::os::unix::net::UnixStream::connect("/run/miznd_cmd.sock") {
-            let cmd = IpcCommand::BlockIp(ip);
             let mut buf     = [0u8; 128];
             let mut scratch = [0u8; 128];
             
@@ -117,13 +116,28 @@ impl AppState {
             };
 
             if len > 0 {
-                let _ = sock.write_all(&(len as u32).to_be_bytes());
-                let _ = sock.write_all(&buf[..len]);
+                return sock.write_all(&(len as u32).to_be_bytes()).is_ok()
+                    && sock.write_all(&buf[..len]).is_ok();
             }
         }
-        let addr = std::net::Ipv4Addr::from(ip.to_be());
+        false
+    }
+
+    pub fn block_ip(&mut self, ip: u32) {
+        let address = IpcAddress::V4(ip.to_ne_bytes());
+        if !self.send_command(IpcCommand::BlockIp(address.clone())) {
+            return;
+        }
+        let addr = std::net::Ipv4Addr::from(ip.to_ne_bytes());
         if self.blocked_ips.len() >= 64 { self.blocked_ips.pop_front(); }
-        self.blocked_ips.push_back(format!("  {}", addr));
+        self.blocked_ips.push_back((address, format!("  {} (15m)", addr)));
+    }
+
+    pub fn unblock_last_ip(&mut self) {
+        let Some((address, _)) = self.blocked_ips.back() else { return; };
+        if self.send_command(IpcCommand::UnblockIp(address.clone())) {
+            self.blocked_ips.pop_back();
+        }
     }
 
     pub fn block_top_ip(&mut self) {
