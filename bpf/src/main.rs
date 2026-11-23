@@ -6,6 +6,7 @@ mod headers;
 mod maps;
 mod metrics;
 mod parsing;
+mod port_scan;
 
 use aya_ebpf::{
     bindings::{TC_ACT_PIPE, xdp_action},

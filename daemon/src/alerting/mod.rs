@@ -7,6 +7,7 @@ mod dispatch;
 mod rules;
 
 const ALERT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+pub const PORT_SCAN_ALERT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 
 #[derive(Debug, Clone)]
 pub struct AlertConfig {
@@ -54,6 +55,7 @@ pub struct Alert {
     pub message: String,
     pub trigger_pcap: bool,
     pub(crate) cooldown_key: String,
+    pub(crate) cooldown: std::time::Duration,
 }
 
 #[allow(dead_code)]
@@ -79,11 +81,15 @@ pub fn spawn(
             let mut alerts: Vec<Alert> = Vec::new();
             rules::evaluate_rules(&state, &config, &mut alerts);
             let now = Instant::now();
-            last_sent.retain(|_, sent_at| now.saturating_duration_since(*sent_at) < ALERT_COOLDOWN);
+            last_sent.retain(|_, (sent_at, cooldown)| {
+                now.saturating_duration_since(*sent_at) < *cooldown
+            });
 
             for alert in alerts
                 .into_iter()
-                .filter(|alert| permit_alert(&mut last_sent, &alert.cooldown_key, now))
+                .filter(|alert| {
+                    permit_alert(&mut last_sent, &alert.cooldown_key, alert.cooldown, now)
+                })
             {
                 if let Some(ref url) = config.webhook_url {
                     let url = url.clone();
@@ -109,11 +115,16 @@ pub fn spawn(
     (state_tx, alert_rx)
 }
 
-fn permit_alert(last_sent: &mut HashMap<String, Instant>, key: &str, now: Instant) -> bool {
+fn permit_alert(
+    last_sent: &mut HashMap<String, (Instant, std::time::Duration)>,
+    key: &str,
+    cooldown: std::time::Duration,
+    now: Instant,
+) -> bool {
     if last_sent.contains_key(key) {
         return false;
     }
-    last_sent.insert(key.to_owned(), now);
+    last_sent.insert(key.to_owned(), (now, cooldown));
     true
 }
 
@@ -126,17 +137,18 @@ mod tests {
         let now = Instant::now();
         let mut last_sent = HashMap::new();
 
-        assert!(permit_alert(&mut last_sent, "high-bandwidth:42", now));
-        assert!(!permit_alert(&mut last_sent, "high-bandwidth:42", now));
-        assert!(permit_alert(&mut last_sent, "port-scan:42", now));
+        assert!(permit_alert(&mut last_sent, "high-bandwidth:42", ALERT_COOLDOWN, now));
+        assert!(!permit_alert(&mut last_sent, "high-bandwidth:42", ALERT_COOLDOWN, now));
+        assert!(permit_alert(&mut last_sent, "port-scan:42", ALERT_COOLDOWN, now));
 
         let after_cooldown = now + ALERT_COOLDOWN;
-        last_sent.retain(|_, sent_at| {
-            after_cooldown.saturating_duration_since(*sent_at) < ALERT_COOLDOWN
+        last_sent.retain(|_, (sent_at, cooldown)| {
+            after_cooldown.saturating_duration_since(*sent_at) < *cooldown
         });
         assert!(permit_alert(
             &mut last_sent,
             "high-bandwidth:42",
+            ALERT_COOLDOWN,
             after_cooldown
         ));
     }

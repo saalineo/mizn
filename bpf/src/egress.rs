@@ -7,11 +7,13 @@ use aya_ebpf::programs::TcContext;
 use mizn_common::bpf::FlowKey;
 
 use crate::headers::{EthernetHeader, IcmpHeader, Ipv4Header, Ipv6Header, TcpHeader, UdpHeader};
+use crate::maps::PORT_SCAN_TX;
 use crate::metrics::{update_tx_metrics, update_tx_metrics_with_sni};
 use crate::parsing::{
-    ipv4_to_v6_mapped, make_flow_key, ETH_IPV4, ETH_IPV6, PROTO_ICMP, PROTO_ICMP6, PROTO_TCP,
-    PROTO_UDP,
+    ETH_IPV4, ETH_IPV6, PROTO_ICMP, PROTO_ICMP6, PROTO_TCP, PROTO_UDP, ipv4_to_v6_mapped,
+    make_flow_key,
 };
+use crate::port_scan::record_probe;
 
 #[inline(always)]
 fn load<T>(ctx: &TcContext, offset: usize) -> Result<T, ()> {
@@ -103,6 +105,9 @@ fn process_transport(
         )
     };
     unsafe {
+        if protocol == PROTO_TCP {
+            record_probe(&PORT_SCAN_TX, 1, source_ip, destination_port, flags);
+        }
         if protocol == PROTO_TCP || protocol == PROTO_UDP {
             update_tx_metrics_with_sni(
                 ctx,

@@ -37,6 +37,18 @@ pub struct IpcState {
     pub history_ring_buffer_cursor: usize,
     pub telemetry_initialization_timestamp_millis: u64,
     pub recent_alerts: Vec<String>,
+    pub active_port_scans: Vec<IpcPortScan>,
+    pub inbound_scan_max_ports: u16,
+    pub outbound_scan_max_ports: u16,
+    pub port_scan_detection_degraded: bool,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[archive(check_bytes)]
+pub struct IpcPortScan {
+    pub source_ip: [u8; 16],
+    pub distinct_ports: u16,
+    pub outbound: bool,
 }
 
 impl Default for IpcState {
@@ -53,6 +65,10 @@ impl Default for IpcState {
             history_ring_buffer_cursor: 0,
             telemetry_initialization_timestamp_millis: 0,
             recent_alerts: Vec::with_capacity(32),
+            active_port_scans: Vec::new(),
+            inbound_scan_max_ports: 0,
+            outbound_scan_max_ports: 0,
+            port_scan_detection_degraded: false,
         }
     }
 }

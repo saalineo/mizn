@@ -1,8 +1,11 @@
 use crate::core::database;
 use crate::features::process_map::SocketsMap;
-use aya::maps::{HashMap as BpfHashMap, MapData, PerCpuHashMap as BpfPerCpuHashMap};
-use mizn_common::bpf::{FlowKey, FlowMetrics};
-use mizn_common::ipc::{IpcAddress, IpcCommand, IpcProcessMetrics, IpcState};
+use aya::maps::{
+    HashMap as BpfHashMap, MapData, PerCpuArray as BpfPerCpuArray,
+    PerCpuHashMap as BpfPerCpuHashMap,
+};
+use mizn_common::bpf::{FlowKey, FlowMetrics, ScanKey, ScanObservation};
+use mizn_common::ipc::{IpcAddress, IpcCommand, IpcPortScan, IpcProcessMetrics, IpcState};
 use rkyv::Infallible;
 use rkyv::ser::Serializer;
 use rkyv::ser::serializers::{BufferScratch, BufferSerializer, CompositeSerializer};
@@ -22,6 +25,8 @@ const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const BLOCK_DURATION: Duration = Duration::from_secs(15 * 60);
 const BLOCKLIST_V4_CAPACITY: usize = 1_024;
 const BLOCKLIST_V6_CAPACITY: usize = 256;
+const PORT_SCAN_WINDOW_NS: u64 = 30_000_000_000;
+const PORT_SCAN_THRESHOLD: u16 = 20;
 
 pub struct CoreLoopArgs {
     pub bpf: aya::Ebpf,
@@ -48,6 +53,8 @@ pub async fn run(mut args: CoreLoopArgs) {
     let mut active_blocks = HashMap::<IpcAddress, Instant>::new();
     let mut installed_v4 = HashSet::new();
     let mut installed_v6 = HashSet::new();
+    let mut port_scan_drop_total = 0u64;
+    let mut port_scan_degraded_until = None;
 
     loop {
         tokio::time::sleep(AGGREGATION_INTERVAL).await;
@@ -262,6 +269,17 @@ pub async fn run(mut args: CoreLoopArgs) {
             }
         }
 
+        let port_scan_summary = refresh_port_scans(&mut args.bpf, &mut unavailable_maps);
+        if port_scan_summary.drops > port_scan_drop_total {
+            port_scan_degraded_until = Some(now + Duration::from_nanos(PORT_SCAN_WINDOW_NS));
+        }
+        port_scan_drop_total = port_scan_summary.drops;
+        global_state.active_port_scans = port_scan_summary.active_scans;
+        global_state.inbound_scan_max_ports = port_scan_summary.inbound_max_ports;
+        global_state.outbound_scan_max_ports = port_scan_summary.outbound_max_ports;
+        global_state.port_scan_detection_degraded =
+            !port_scan_summary.available || port_scan_degraded_until.is_some_and(|until| until > now);
+
         global_state.finalize_tick(dtx, drx);
 
         while let Ok(msg) = args.ui_alert_rx.try_recv() {
@@ -270,14 +288,6 @@ pub async fn run(mut args: CoreLoopArgs) {
 
         let mut new_alerts = Vec::new();
         for pm in global_state.active_process_telemetry.values() {
-            let syn_no_ack = (pm.tcp_flags & 0x02 != 0) && (pm.tcp_flags & 0x10 == 0);
-            if syn_no_ack {
-                let msg = format!(
-                    "Port Scan: {} (PID {})",
-                    pm.process_nomenclature, pm.process_identifier
-                );
-                new_alerts.push(msg);
-            }
             let high_bw = (pm.transmission_rate_bytes_per_second
                 + pm.reception_rate_bytes_per_second)
                 > 52_428_800; // 50MB/s
@@ -320,6 +330,134 @@ pub async fn run(mut args: CoreLoopArgs) {
         if len > 0 {
             broadcast(&args.connections, &serial_buf[..len]).await;
         }
+    }
+}
+
+struct PortScanSummary {
+    active_scans: Vec<IpcPortScan>,
+    inbound_max_ports: u16,
+    outbound_max_ports: u16,
+    drops: u64,
+    available: bool,
+}
+
+fn refresh_port_scans(
+    bpf: &mut aya::Ebpf,
+    unavailable_maps: &mut HashSet<&'static str>,
+) -> PortScanSummary {
+    let now_ns = monotonic_ns();
+    let mut scans = Vec::new();
+    let mut available = true;
+    let mut inbound_max_ports = 0;
+    let mut outbound_max_ports = 0;
+
+    for (map_name, outbound) in [("PORT_SCAN_RX", false), ("PORT_SCAN_TX", true)] {
+        let Some(map) = bpf.map_mut(map_name) else {
+            if unavailable_maps.insert(map_name) {
+                eprintln!("[miznd] BPF object is missing required {map_name} map");
+            }
+            available = false;
+            continue;
+        };
+        let Ok(mut observations) = BpfHashMap::<_, ScanKey, ScanObservation>::try_from(map) else {
+            if unavailable_maps.insert(map_name) {
+                eprintln!("[miznd] {map_name} map is unusable");
+            }
+            available = false;
+            continue;
+        };
+
+        let entries = observations
+            .iter()
+            .filter_map(|entry| entry.ok())
+            .collect::<Vec<_>>();
+        let (counts, stale_keys) = summarize_port_scans(&entries, now_ns);
+        for key in stale_keys {
+            // A concurrent refresh can re-add this probe; the next tick
+            // observes it again, while stale entries cannot pin the map.
+            let _ = observations.remove(&key);
+        }
+        let max_ports = counts.values().copied().max().unwrap_or_default();
+        if outbound {
+            outbound_max_ports = max_ports;
+        } else {
+            inbound_max_ports = max_ports;
+        }
+        scans.extend(
+            counts
+                .into_iter()
+                .filter_map(|(source_ip, distinct_ports)| {
+                    (distinct_ports >= PORT_SCAN_THRESHOLD).then_some(IpcPortScan {
+                        source_ip,
+                        distinct_ports,
+                        outbound,
+                    })
+                }),
+        );
+    }
+
+    let mut drops = 0u64;
+    match bpf.map_mut("PORT_SCAN_DROPS") {
+        Some(map) => match BpfPerCpuArray::<_, u64>::try_from(map) {
+            Ok(counters) => {
+                for slot in 0..2 {
+                    if let Ok(values) = counters.get(&slot, 0) {
+                        drops += values.iter().copied().sum::<u64>();
+                    }
+                }
+            }
+            Err(error) => {
+                if unavailable_maps.insert("PORT_SCAN_DROPS") {
+                    eprintln!("[miznd] PORT_SCAN_DROPS map is unusable: {error}");
+                }
+                available = false;
+            }
+        },
+        None => {
+            if unavailable_maps.insert("PORT_SCAN_DROPS") {
+                eprintln!("[miznd] BPF object is missing required PORT_SCAN_DROPS map");
+            }
+            available = false;
+        }
+    }
+
+    scans.sort_by_key(|scan| (scan.outbound, scan.source_ip));
+    PortScanSummary {
+        active_scans: scans,
+        inbound_max_ports,
+        outbound_max_ports,
+        drops,
+        available,
+    }
+}
+
+fn summarize_port_scans(
+    entries: &[(ScanKey, ScanObservation)],
+    now_ns: u64,
+) -> (HashMap<[u8; 16], u16>, Vec<ScanKey>) {
+    let mut counts = HashMap::<[u8; 16], u16>::new();
+    let mut stale_keys = Vec::new();
+    for (key, observation) in entries {
+        if now_ns.saturating_sub(observation.last_seen_ns) < PORT_SCAN_WINDOW_NS {
+            *counts.entry(key.source_ip).or_default() += 1;
+        } else {
+            stale_keys.push(*key);
+        }
+    }
+    (counts, stale_keys)
+}
+
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
+    } else {
+        0
     }
 }
 
@@ -514,7 +652,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{can_add_block, expire_blocks, is_protected_address, is_protected_by_policy, write_telemetry_frame, BLOCKLIST_V6_CAPACITY};
+    use super::{
+        BLOCKLIST_V6_CAPACITY, PORT_SCAN_WINDOW_NS, can_add_block, expire_blocks,
+        is_protected_address, is_protected_by_policy, summarize_port_scans, write_telemetry_frame,
+    };
+    use mizn_common::bpf::{ScanKey, ScanObservation};
     use mizn_common::ipc::IpcAddress;
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
@@ -559,7 +701,10 @@ mod tests {
             IpcAddress::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 53]),
         ]);
 
-        assert!(is_protected_by_policy(&IpcAddress::V4([192, 0, 2, 1]), &protected));
+        assert!(is_protected_by_policy(
+            &IpcAddress::V4([192, 0, 2, 1]),
+            &protected
+        ));
         assert!(is_protected_by_policy(
             &IpcAddress::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 53]),
             &protected,
@@ -590,7 +735,36 @@ mod tests {
             blocks.insert(IpcAddress::V6(address), now);
         }
 
-        assert!(!can_add_block(&blocks, &IpcAddress::V6([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])));
-        assert!(can_add_block(&blocks, &IpcAddress::V6([42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])));
+        assert!(!can_add_block(
+            &blocks,
+            &IpcAddress::V6([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        ));
+        assert!(can_add_block(
+            &blocks,
+            &IpcAddress::V6([42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        ));
+    }
+
+    #[test]
+    fn scan_summary_counts_distinct_fresh_ports_and_expires_old_ones() {
+        let source = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 7];
+        let fresh = ScanObservation {
+            last_seen_ns: PORT_SCAN_WINDOW_NS * 2 - 1,
+        };
+        let stale = ScanObservation {
+            last_seen_ns: PORT_SCAN_WINDOW_NS,
+        };
+        let key = |port| ScanKey {
+            source_ip: source,
+            destination_port: port,
+            _alignment_padding: [0; 6],
+        };
+        let (counts, stale_keys) = summarize_port_scans(
+            &[(key(22), fresh), (key(80), fresh), (key(443), stale)],
+            PORT_SCAN_WINDOW_NS * 2,
+        );
+
+        assert_eq!(counts.get(&source), Some(&2));
+        assert_eq!(stale_keys, vec![key(443)]);
     }
 }

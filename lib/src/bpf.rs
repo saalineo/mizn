@@ -31,10 +31,35 @@ pub struct FlowMetrics {
 #[cfg(feature = "std")]
 unsafe impl aya::Pod for FlowMetrics {}
 
+/// A unique TCP probe destination observed for one network source.
+///
+/// Direction is represented by the BPF map containing this key: RX maps are
+/// inbound probes and TX maps are outbound probes.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "std", derive(Debug, Hash))]
+pub struct ScanKey {
+    pub source_ip: [u8; 16],
+    pub destination_port: u16,
+    pub _alignment_padding: [u8; 6],
+}
+
+#[cfg(feature = "std")]
+unsafe impl aya::Pod for ScanKey {}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub struct ScanObservation {
+    pub last_seen_ns: u64,
+}
+
+#[cfg(feature = "std")]
+unsafe impl aya::Pod for ScanObservation {}
+
 impl Default for FlowMetrics {
     #[inline(always)]
     fn default() -> Self {
         unsafe { core::mem::zeroed() }
     }
 }
-
