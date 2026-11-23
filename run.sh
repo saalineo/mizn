@@ -64,8 +64,8 @@ if pgrep -x "miznd" > /dev/null; then
 else
     echo "[*] Starting MIZN Daemon in the background..."
     rm -f /run/miznd.sock /run/miznd_cmd.sock
-    DAEMON_LOG="/tmp/miznd.log"
-    : > "$DAEMON_LOG"
+    install -d -m 0750 /var/log/mizn
+    DAEMON_LOG="$(mktemp /var/log/mizn/miznd.XXXXXX.log)"
     ./target/debug/miznd >"$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
     sleep 2

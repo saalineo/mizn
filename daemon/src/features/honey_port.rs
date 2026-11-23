@@ -8,18 +8,17 @@
 //! Any inbound connection is immediately closed after the attacker IP and
 //! targeted port are logged to the `threat_alerts` SQLite table.
 
-use rusqlite::Connection;
+use crate::features::security_writer::{SecurityWrite, SecurityWriteSender};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 /// Ports that legitimate software has no reason to contact.
 const HONEY_PORTS: &[u16] = &[21, 23, 2323];
 
 /// Spawn async Tokio tasks for all honey-port listeners.
-pub fn start(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::UnboundedSender<String>) {
+pub fn start(db_writes: SecurityWriteSender, alert_tx: tokio::sync::mpsc::UnboundedSender<String>) {
     for &port in HONEY_PORTS {
-        let db = db.clone();
+        let db_writes = db_writes.clone();
         let alert_tx = alert_tx.clone();
         tokio::spawn(async move {
             let addr = format!("0.0.0.0:{port}");
@@ -40,7 +39,7 @@ pub fn start(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::UnboundedS
                         // Drop the socket immediately — the tarpit sends nothing.
                         drop(socket);
                         let _ = alert_tx.send(format!("HONEY TRAP: {remote} hit port {port}"));
-                        handle_trigger(&db, remote, port);
+                        handle_trigger(&db_writes, remote, port);
                     }
                     Err(e) => {
                         eprintln!("[miznd][honey] Accept error on port {port}: {e}");
@@ -51,20 +50,15 @@ pub fn start(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::UnboundedS
     }
 }
 
-fn handle_trigger(db: &Arc<Mutex<Connection>>, remote: SocketAddr, port: u16) {
+fn handle_trigger(db_writes: &SecurityWriteSender, remote: SocketAddr, port: u16) {
     let attacker_ip = remote.ip().to_string();
-    eprintln!(
-        "[miznd][honey][ALERT] HONEY_PORT_TRIGGER → attacker={attacker_ip} port={port}"
-    );
+    eprintln!("[miznd][honey][ALERT] HONEY_PORT_TRIGGER → attacker={attacker_ip} port={port}");
 
-    if let Ok(conn) = db.lock() {
-        if let Err(e) = crate::core::database::record_threat_alert(
-            &conn,
-            "HONEY_PORT_TRIGGER",
-            &attacker_ip,
-            port,
-        ) {
-            eprintln!("[miznd][honey] DB write error: {e}");
-        }
+    if let Err(error) = db_writes.try_send(SecurityWrite::ThreatAlert {
+        alert_type: "HONEY_PORT_TRIGGER",
+        attacker_ip,
+        target_port: port,
+    }) {
+        eprintln!("[miznd][honey] security database queue unavailable: {error}");
     }
 }

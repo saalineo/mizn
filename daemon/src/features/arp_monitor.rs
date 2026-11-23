@@ -11,9 +11,8 @@
 //!   - `arp_registry`   — canonical IP→MAC state table
 //!   - `threat_alerts`  — high-severity alerts (spoof only)
 
-use rusqlite::Connection;
+use crate::features::security_writer::{SecurityWrite, SecurityWriteSender};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 // ARP packet layout offsets (after the 14-byte Ethernet header)
 // Byte offsets within the ARP payload (standard 28-byte IPv4 ARP):
@@ -35,14 +34,17 @@ const MIN_FRAME_LEN: usize = ETH_HLEN + 28;
 const ETH_P_ARP: u16 = 0x0806;
 
 /// Spawn a dedicated OS thread that reads ARP frames from a raw socket.
-pub fn start(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::UnboundedSender<String>) {
+pub fn start(db_writes: SecurityWriteSender, alert_tx: tokio::sync::mpsc::UnboundedSender<String>) {
     std::thread::Builder::new()
         .name("mizn-arp".into())
-        .spawn(move || run_arp_loop(db, alert_tx))
+        .spawn(move || run_arp_loop(db_writes, alert_tx))
         .expect("failed to spawn ARP monitor thread");
 }
 
-fn run_arp_loop(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::UnboundedSender<String>) {
+fn run_arp_loop(
+    db_writes: SecurityWriteSender,
+    alert_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) {
     // Open raw AF_PACKET socket for ARP frames only.
     // SAFETY: libc FFI — standard socket(2) call.
     let sock = unsafe {
@@ -67,9 +69,7 @@ fn run_arp_loop(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::Unbound
     let mut buf = [0u8; 2048];
 
     loop {
-        let n = unsafe {
-            libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-        };
+        let n = unsafe { libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
             eprintln!(
                 "[miznd][arp] recv error: {}",
@@ -101,34 +101,48 @@ fn run_arp_loop(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::Unbound
             continue;
         }
 
-        let ip_str = format!("{}.{}.{}.{}", spa[0], spa[1], spa[2], spa[3]);
-        let mac_str = format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            sha[0], sha[1], sha[2], sha[3], sha[4], sha[5]
-        );
-
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         match registry.get(&spa) {
             None => {
                 // First time  seen this IP.
-                eprintln!(
-                    "[miznd][arp] NEW_DEVICE_DETECTED  ip={ip_str} mac={mac_str}"
+                let ip_str = format!("{}.{}.{}.{}", spa[0], spa[1], spa[2], spa[3]);
+                let mac_str = format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    sha[0], sha[1], sha[2], sha[3], sha[4], sha[5]
                 );
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                eprintln!("[miznd][arp] NEW_DEVICE_DETECTED  ip={ip_str} mac={mac_str}");
                 registry.insert(spa, sha);
-                if let Ok(conn) = db.lock() {
-                    let _ = crate::core::database::upsert_arp_entry(&conn, &ip_str, &mac_str, ts);
-                }
+                queue_write(
+                    &db_writes,
+                    SecurityWrite::ArpEntry {
+                        ip: ip_str,
+                        mac: mac_str,
+                        last_seen: ts,
+                    },
+                );
             }
             Some(&known_mac) if known_mac != sha => {
                 // Same IP, different MAC → ARP spoofing!
+                let ip_str = format!("{}.{}.{}.{}", spa[0], spa[1], spa[2], spa[3]);
+                let mac_str = format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    sha[0], sha[1], sha[2], sha[3], sha[4], sha[5]
+                );
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 let known_str = format!(
                     "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                    known_mac[0], known_mac[1], known_mac[2],
-                    known_mac[3], known_mac[4], known_mac[5]
+                    known_mac[0],
+                    known_mac[1],
+                    known_mac[2],
+                    known_mac[3],
+                    known_mac[4],
+                    known_mac[5]
                 );
                 eprintln!(
                     "[miznd][arp][ALERT] ARP_SPOOF_ATTACK ip={ip_str} \
@@ -136,22 +150,36 @@ fn run_arp_loop(db: Arc<Mutex<Connection>>, alert_tx: tokio::sync::mpsc::Unbound
                 );
                 // Update registry to latest MAC (could be legitimate change)
                 registry.insert(spa, sha);
-                let detail = format!("ARP_SPOOF_ATTACK: {ip_str} changed MAC {known_str}→{mac_str}");
+                let detail =
+                    format!("ARP_SPOOF_ATTACK: {ip_str} changed MAC {known_str}→{mac_str}");
                 let _ = alert_tx.send(detail.clone());
-                if let Ok(conn) = db.lock() {
-                    let _ = crate::core::database::upsert_arp_entry(&conn, &ip_str, &mac_str, ts);
-                    // Log as a critical threat alert (port 0 = N/A for ARP)
-                    let _ = crate::core::database::record_threat_alert(&conn, "ARP_SPOOF_ATTACK", &detail, 0);
-                }
+                queue_write(
+                    &db_writes,
+                    SecurityWrite::ArpEntry {
+                        ip: ip_str,
+                        mac: mac_str,
+                        last_seen: ts,
+                    },
+                );
+                // Log as a critical threat alert (port 0 = N/A for ARP)
+                queue_write(
+                    &db_writes,
+                    SecurityWrite::ThreatAlert {
+                        alert_type: "ARP_SPOOF_ATTACK",
+                        attacker_ip: detail,
+                        target_port: 0,
+                    },
+                );
             }
-            _ => {
-                // MAC unchanged — just update last_seen timestamp.
-                if let Ok(conn) = db.lock() {
-                    let _ = crate::core::database::upsert_arp_entry(&conn, &ip_str, &mac_str, ts);
-                }
-            }
+            _ => {}
         }
     }
 
     unsafe { libc::close(sock) };
+}
+
+fn queue_write(tx: &SecurityWriteSender, write: SecurityWrite) {
+    if let Err(error) = tx.try_send(write) {
+        eprintln!("[miznd][arp] security database queue unavailable: {error}");
+    }
 }

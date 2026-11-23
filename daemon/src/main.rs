@@ -1,9 +1,9 @@
 mod alerting;
-pub mod core;
-pub mod features;
 mod bpf_loader;
 mod clickhouse;
+pub mod core;
 mod core_loop;
+pub mod features;
 mod ipc_server;
 mod pcap_task;
 mod pcap_writer;
@@ -20,13 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bpf_ctx = bpf_loader::BpfContext::load_and_attach(&iface)?;
 
-
     let db = Arc::new(Mutex::new(
         crate::core::database::open("miznd_telemetry.db").expect("Failed to open SQLite db"),
     ));
+    let security_db_writes = crate::features::security_writer::start(db.clone());
 
     // Socket → PID resolver
-    let socket_registry = Arc::new(RwLock::new(crate::features::process_map::SocketsMap::with_capacity(8192)));
+    let socket_registry = Arc::new(RwLock::new(
+        crate::features::process_map::SocketsMap::with_capacity(8192),
+    ));
     {
         let reg = socket_registry.clone();
         tokio::spawn(async move {
@@ -56,10 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ui_alert_tx, ui_alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Honey-ports
-    crate::features::honey_port::start(db.clone(), ui_alert_tx.clone());
+    crate::features::honey_port::start(security_db_writes.clone(), ui_alert_tx.clone());
 
     // ARP Monitoring (Layer 2)
-    crate::features::arp_monitor::start(db.clone(), ui_alert_tx.clone());
+    crate::features::arp_monitor::start(security_db_writes, ui_alert_tx.clone());
 
     // Core loop (eBPF flow aggregation + telemetry)
     core_loop::run(core_loop::CoreLoopArgs {
@@ -100,5 +102,7 @@ fn detect_iface() -> String {
             2
         }
     });
-    list.into_iter().next().unwrap_or_else(|| "wlan0".to_string())
+    list.into_iter()
+        .next()
+        .unwrap_or_else(|| "wlan0".to_string())
 }
