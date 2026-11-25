@@ -593,7 +593,12 @@ pub fn resolve_flow(reg: &SocketsMap, key: &FlowKey, is_tx: bool) -> Option<(i32
     } else {
         key.destination_port
     };
-    reg.get(&local_port).map(|s| (s.0, s.1.clone()))
+    // Unresolved flows go to pid 0 so aggregate throughput isn't under-counted.
+    Some(
+        reg.get(&(key.protocol, local_port))
+            .cloned()
+            .unwrap_or_else(|| (0, String::from("unattributed"))),
+    )
 }
 
 pub fn proto_name(p: u8) -> &'static str {

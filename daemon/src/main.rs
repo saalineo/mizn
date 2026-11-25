@@ -33,7 +33,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reg = socket_registry.clone();
         tokio::spawn(async move {
             loop {
-                let map = crate::features::process_map::refresh_sockets_map();
+                // /proc walk is blocking file I/O; keep it off the async workers.
+                let Ok(map) = tokio::task::spawn_blocking(
+                    crate::features::process_map::refresh_sockets_map,
+                )
+                .await
+                else {
+                    continue;
+                };
                 *reg.write().await = map;
                 tokio::time::sleep(REFRESH_INTERVAL).await;
             }
